@@ -1,0 +1,156 @@
+/**
+ * @fileoverview WhatsApp Chatbot Webhook & Appointment Collision Engine.
+ * Features state-machine conversation handling and real-time scheduling.
+ * Developed for custom Low-Code CRM (Google Workspace / Apps Script).
+ * Author: Lester - Mi Data Flow
+ */
+
+// ============================================
+// WEBHOOK & STATE MACHINE (BOT LOGIC)
+// ============================================
+
+/**
+ * Punto de entrada del Webhook para mensajes entrantes de WhatsApp.
+ */
+function doPost(e) {
+  try {
+    const datos = JSON.parse(e.postData.contents);
+    if (datos.action === 'webhook_whatsapp') {
+      return manejarMensajeWhatsApp(datos);
+    }
+    return ContentService.createTextOutput(JSON.stringify({ success: false, error: 'Acción no reconocida' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (error) {
+    return ContentService.createTextOutput(JSON.stringify({ success: false, error: error.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Máquina de estados que gestiona el flujo de la conversación del usuario,
+ * utilizando CacheService para recordar el contexto entre cada mensaje.
+ */
+function manejarMensajeWhatsApp(datos) {
+  const telefono = datos.telefono;
+  const mensaje = datos.mensaje.toLowerCase().trim();
+  
+  // Obtener estado actual de la sesión del usuario desde la memoria caché
+  const estado = obtenerEstadoConversacion(telefono);
+  let respuesta = '';
+  let nuevoEstado = estado;
+
+  // Flujo 1: Inicio de conversación
+  if (!estado || mensaje.includes('hola') || mensaje.includes('inicio')) {
+    respuesta = `¡Hola! 👋 Bienvenido.\nTenemos 2 sucursales para servirte.\n¿En cuál te gustaría agendar?\nResponde con el número (1 o 2)`;
+    nuevoEstado = 'esperando_sucursal';
+    
+  // Flujo 2: Selección de Sucursal
+  } else if (estado === 'esperando_sucursal') {
+    const sucursalId = parseInt(mensaje);
+    if (sucursalId === 1 || sucursalId === 2) {
+      guardarDatoTemporal(telefono, 'sucursalId', sucursalId);
+      respuesta = `¡Perfecto! ✅\nAhora dime, ¿cuál es tu nombre completo? 👤`;
+      nuevoEstado = 'esperando_nombre';
+    } else {
+      respuesta = `Por favor responde con 1 para Centro o 2 para Norte 😊`;
+    }
+    
+  // Flujo 3: Captura de Nombre y Selección de Servicio
+  } else if (estado === 'esperando_nombre') {
+    guardarDatoTemporal(telefono, 'nombre', mensaje);
+    respuesta = `Mucho gusto! 😊\n¿Qué servicio te interesa?\n1. Corte\n2. Barba\n3. Corte + Barba\nResponde con el número.`;
+    nuevoEstado = 'esperando_servicio';
+    
+  // Flujo 4: Selección de Fecha y Hora (El usuario llega a este punto tras elegir servicio y staff)
+  } else if (estado === 'esperando_hora') {
+    const hora = validarHora(mensaje); // Valida formatos 24h y 12h
+    if (hora) {
+      const fecha = obtenerDatoTemporal(telefono, 'fecha');
+      const staffId = obtenerDatoTemporal(telefono, 'barberoId');
+      
+      // Lógica crítica: Verificar que el horario no choque con otra cita existente
+      const disponible = verificarDisponibilidad(staffId, fecha, hora, 30); // 30 min por defecto para el ejemplo
+      
+      if (disponible) {
+        // Lógica de guardado en base de datos omitida por brevedad
+        respuesta = `🎉 ¡Cita agendada exitosamente!\n📅 Fecha: ${fecha}\n⏰ Hora: ${hora}\nTe esperamos!`;
+        limpiarDatosTemporales(telefono);
+        nuevoEstado = 'completado';
+      } else {
+        respuesta = `❌ Lo sentimos, ese horario ya está ocupado. Por favor intenta con otra hora.`;
+      }
+    } else {
+      respuesta = `Hora inválida. Por favor usa formato de 24h (14:00) o 12h (2:00 PM)`;
+    }
+  }
+  
+  // Actualizar la sesión en caché para el próximo mensaje
+  actualizarEstadoConversacion(telefono, nuevoEstado);
+  
+  return ContentService.createTextOutput(JSON.stringify({ success: true, respuesta: respuesta, telefono: telefono }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ============================================
+// TIME COLLISION & SCHEDULING ENGINE
+// ============================================
+
+/**
+ * Algoritmo para detectar solapamiento de horarios (Time Collision).
+ * Verifica si un nuevo bloque de tiempo choca con citas existentes.
+ */
+function verificarDisponibilidad(staffId, fecha, hora, duracionMinutos) {
+  // obtenerCitas es una función auxiliar que extrae las citas de ese día desde Google Sheets
+  const citasDelDia = obtenerCitas({ fecha: fecha, barberoId: staffId }); 
+  
+  const horaInicioNuevo = convertirHoraAMinutos(hora);
+  const horaFinNuevo = horaInicioNuevo + duracionMinutos;
+  
+  for (let cita of citasDelDia) {
+    if (cita.estado === 'Cancelada') continue;
+    
+    const citaInicioExistente = convertirHoraAMinutos(cita.hora);
+    const citaFinExistente = citaInicioExistente + cita.duracion;
+    
+    // Lógica de intersección de rangos de tiempo
+    if ((horaInicioNuevo >= citaInicioExistente && horaInicioNuevo < citaFinExistente) ||
+        (horaFinNuevo > citaInicioExistente && horaFinNuevo <= citaFinExistente) ||
+        (horaInicioNuevo <= citaInicioExistente && horaFinNuevo >= citaFinExistente)) {
+      return false; // Hay colisión, el horario NO está disponible
+    }
+  }
+  
+  return true; // Horario libre
+}
+
+function convertirHoraAMinutos(hora) {
+  const partes = hora.split(':');
+  return parseInt(partes[0]) * 60 + parseInt(partes[1]);
+}
+
+// ============================================
+// CACHE SERVICE (SESSION MANAGEMENT)
+// ============================================
+
+function obtenerEstadoConversacion(telefono) {
+  return CacheService.getScriptCache().get('estado_' + telefono);
+}
+
+function actualizarEstadoConversacion(telefono, estado) {
+  CacheService.getScriptCache().put('estado_' + telefono, estado, 3600); // Expira en 1 hora
+}
+
+function guardarDatoTemporal(telefono, clave, valor) {
+  CacheService.getScriptCache().put(telefono + '_' + clave, valor.toString(), 3600);
+}
+
+function obtenerDatoTemporal(telefono, clave) {
+  const valor = CacheService.getScriptCache().get(telefono + '_' + clave);
+  return valor ? (isNaN(valor) ? valor : parseInt(valor)) : null;
+}
+
+function limpiarDatosTemporales(telefono) {
+  const cache = CacheService.getScriptCache();
+  const claves = ['sucursalId', 'nombre', 'servicioId', 'barberoId', 'fecha'];
+  claves.forEach(clave => cache.remove(telefono + '_' + clave));
+}
